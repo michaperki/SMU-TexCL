@@ -976,8 +976,12 @@ def main():
     print(f"Running model diagnostics on the SMU-TexCL dataset")
     print(f"Output directory: {args.output_dir}")
     
-    # Create output directory if not exists
+    # Ensure output directory is created
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Override OUTPUT_DIR with command-line specified directory
+    global OUTPUT_DIR
+    OUTPUT_DIR = args.output_dir
     
     # Load tabular data
     print("\nLoading tabular data...")
