@@ -25,11 +25,189 @@ from tqdm import tqdm
 sys.path.append(os.path.abspath(".."))
 from data.table_dataset import TableDataset
 from data.windowed_dataset import WindowedDataset
+from models.base_model import BaseModel
 from models.tabular_models import TabularModel
 from models.sequence_models import SequenceModel, PilotDataset, collate_fn
 from utils.visualization import set_plot_style
 from utils.preprocessing import assess_signal_quality
 from utils.evaluation import evaluate_regression_model
+
+def create_turbulence_response_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create turbulence-specific response features.
+    
+    Args:
+        df: DataFrame with features and turbulence levels
+        
+    Returns:
+        DataFrame with added features
+    """
+    # Create a copy to avoid modifying the original
+    enhanced_df = df.copy()
+    
+    # Ensure turbulence column exists
+    if 'turbulence' not in enhanced_df.columns:
+        print("Turbulence column not found, skipping feature creation")
+        return enhanced_df
+    
+    # SCR response based on turbulence level
+    if 'scr_mean' in enhanced_df.columns and 'turbulence' in enhanced_df.columns:
+        # Group by turbulence level to get baselines
+        turb_baselines = enhanced_df.groupby('turbulence')['scr_mean'].mean()
+        
+        # Create response feature relative to turbulence baseline
+        enhanced_df['scr_turb_response'] = enhanced_df.apply(
+            lambda row: row['scr_mean'] - turb_baselines[row['turbulence']], 
+            axis=1
+        )
+    
+    # Heart rate response based on turbulence
+    if 'hr_mean' in enhanced_df.columns and 'turbulence' in enhanced_df.columns:
+        # Group by turbulence level to get baselines
+        hr_baselines = enhanced_df.groupby('turbulence')['hr_mean'].mean()
+        
+        # Create response feature relative to turbulence baseline
+        enhanced_df['hr_turb_response'] = enhanced_df.apply(
+            lambda row: row['hr_mean'] - hr_baselines[row['turbulence']], 
+            axis=1
+        )
+    
+    # Ratio of SCR to HRV by turbulence (stress response indicator)
+    if all(col in enhanced_df.columns for col in ['scr_mean', 'sdrr', 'turbulence']):
+        enhanced_df['scr_hrv_ratio'] = enhanced_df['scr_mean'] / (enhanced_df['sdrr'] + 1e-6)
+        
+        # Normalize by turbulence level
+        ratio_baselines = enhanced_df.groupby('turbulence')['scr_hrv_ratio'].median()
+        enhanced_df['scr_hrv_turb_norm'] = enhanced_df.apply(
+            lambda row: row['scr_hrv_ratio'] / (ratio_baselines[row['turbulence']] + 1e-6),
+            axis=1
+        )
+    
+    return enhanced_df
+
+class OrdinalClassifier(BaseModel):
+    """Ordinal classifier for cognitive load that respects order relationships."""
+    
+    def __init__(self, n_classes: int = 3, alpha: float = 0.1):
+        """Initialize ordinal classifier."""
+        self.n_classes = n_classes
+        self.alpha = alpha
+        self.models = []
+        self.thresholds = []
+        self.class_names = None
+        
+    def train(self, X_train, y_train) -> None:
+        """Train the ordinal classifier with multiple binary classifiers."""
+        # Convert categorical labels to ordinal integers if needed
+        if not pd.api.types.is_numeric_dtype(y_train):
+            self.class_names = np.unique(y_train)
+            y_ordinal = pd.Categorical(y_train, categories=self.class_names, ordered=True).codes
+        else:
+            y_ordinal = y_train
+            
+        # Train binary classifiers for each threshold
+        for k in range(self.n_classes - 1):
+            # Create binary target: 1 if class >= k+1, else 0
+            binary_target = (y_ordinal > k).astype(int)
+            
+            # Train logistic regression model with class weighting
+            from sklearn.linear_model import LogisticRegression
+            model = LogisticRegression(
+                C=1/self.alpha, 
+                class_weight='balanced',
+                random_state=42
+            )
+            model.fit(X_train, binary_target)
+            
+            # Store model
+            self.models.append(model)
+            
+            # Calculate optimal threshold (default 0.5, can be calibrated)
+            self.thresholds.append(0.5)
+    
+    def predict(self, X) -> np.ndarray:
+        """Make ordinal predictions."""
+        if not self.models:
+            raise ValueError("Model has not been trained")
+        
+        # Get probabilities from each binary classifier
+        probs = np.zeros((X.shape[0], len(self.models)))
+        for i, model in enumerate(self.models):
+            probs[:, i] = model.predict_proba(X)[:, 1]
+            
+        # Apply thresholds to get binary decisions
+        binary_decisions = probs >= np.array(self.thresholds).reshape(1, -1)
+        
+        # Convert to ordinal predictions (count number of 1s)
+        ordinal_preds = np.sum(binary_decisions, axis=1)
+        
+        # Convert back to original class names if available
+        if self.class_names is not None:
+            return np.array([self.class_names[min(pred, len(self.class_names)-1)] for pred in ordinal_preds])
+        else:
+            return ordinal_preds
+    
+    def evaluate(self, X_test, y_test, save_path: Optional[str] = None) -> Dict[str, Any]:
+        """Evaluate the ordinal classifier."""
+        # Convert categorical labels to ordinal integers if needed
+        if not pd.api.types.is_numeric_dtype(y_test) and self.class_names is not None:
+            y_ordinal = pd.Categorical(y_test, categories=self.class_names, ordered=True).codes
+        else:
+            y_ordinal = y_test
+            
+        # Get predictions
+        y_pred = self.predict(X_test)
+        
+        # Convert predictions to ordinal if necessary
+        if self.class_names is not None:
+            y_pred_ordinal = pd.Categorical(y_pred, categories=self.class_names, ordered=True).codes
+        else:
+            y_pred_ordinal = y_pred
+            
+        # Calculate ordinal-specific metrics
+        from sklearn.metrics import mean_absolute_error, accuracy_score
+        
+        # MAE as a measure of ordinal distance
+        mae = mean_absolute_error(y_ordinal, y_pred_ordinal)
+        
+        # Standard classification metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        
+        # Calculate adjacent accuracy (predictions off by at most 1 class)
+        adjacent_correct = np.abs(y_ordinal - y_pred_ordinal) <= 1
+        adjacent_accuracy = np.mean(adjacent_correct)
+        
+        metrics = {
+            'accuracy': accuracy,
+            'adjacent_accuracy': adjacent_accuracy,
+            'mae': mae
+        }
+        
+        # Print results
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Adjacent Accuracy: {adjacent_accuracy:.4f}")
+        print(f"Mean Absolute Error: {mae:.4f}")
+        
+        # Plot results if save_path is provided
+        if save_path:
+            from sklearn.metrics import confusion_matrix
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            
+            # Plot confusion matrix
+            cm = confusion_matrix(y_test, y_pred)
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                       xticklabels=self.class_names if self.class_names is not None else 'auto',
+                       yticklabels=self.class_names if self.class_names is not None else 'auto')
+            plt.xlabel('Predicted')
+            plt.ylabel('True')
+            plt.title('Ordinal Classifier Confusion Matrix')
+            plt.tight_layout()
+            plt.savefig(save_path, dpi=300)
+            
+        return metrics
+
+
 
 # Set up plotting style
 set_plot_style()
@@ -442,7 +620,7 @@ def perform_pilot_wise_cv(table_data: TableDataset) -> None:
     print(f"Standard CV - R²: {r2:.4f}, RMSE: {rmse:.4f}, MAE: {mae:.4f}")
 
 def analyze_classification_approach(table_data: TableDataset) -> None:
-    """Try classification instead of regression."""
+    """Try classification instead of regression with improved ordinal approach."""
     print("\n======= Classification Approach Analysis =======")
     
     # Get features and labels
@@ -454,6 +632,9 @@ def analyze_classification_approach(table_data: TableDataset) -> None:
         X['pilot_id'] = table_data.df['pilot_id']
     if 'turbulence' in table_data.df.columns and 'turbulence' not in X.columns:
         X['turbulence'] = table_data.df['turbulence']
+    
+    # Add turbulence-specific features
+    X = create_turbulence_response_features(X)
     
     # Convert the continuous target to categorical
     # Create 3 equal-sized bins for Low, Medium, High cognitive load
@@ -469,8 +650,21 @@ def analyze_classification_approach(table_data: TableDataset) -> None:
     X_train_model = X_train.drop(columns=[col for col in meta_cols if col in X_train.columns])
     X_test_model = X_test.drop(columns=[col for col in meta_cols if col in X_test.columns])
     
-    # Train a classification model
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    # Train ordinal classifier
+    print("Training ordinal classifier...")
+    ordinal_model = OrdinalClassifier(n_classes=3)
+    ordinal_model.train(X_train_model, y_train)
+    
+    # Evaluate ordinal model
+    print("\nOrdinal Classifier Results:")
+    ordinal_metrics = ordinal_model.evaluate(
+        X_test_model, y_test, 
+        save_path=os.path.join(OUTPUT_DIR, 'ordinal_confusion_matrix.png')
+    )
+    
+    # Train a standard classification model for comparison
+    print("\nTraining standard classifier for comparison...")
+    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
     model.fit(X_train_model, y_train)
     
     # Get predictions
@@ -478,29 +672,18 @@ def analyze_classification_approach(table_data: TableDataset) -> None:
     
     # Evaluate model
     classification_scores = classification_report(y_test, y_pred, output_dict=True)
-    print("\nClassification Report:")
+    print("\nStandard Classifier Results:")
     print(classification_report(y_test, y_pred))
     
     # Plot confusion matrix
     plt.figure(figsize=(10, 8))
     cm = confusion_matrix(y_test, y_pred)
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=model.classes_, yticklabels=model.classes_)
-    plt.title('Confusion Matrix')
+    plt.title('Standard Classifier Confusion Matrix')
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, 'confusion_matrix.png'), dpi=300)
-    
-    # Analyze feature importance for classification
-    importances = model.feature_importances_
-    indices = np.argsort(importances)[-20:]  # Top 20 features
-    
-    plt.figure(figsize=(10, 8))
-    plt.barh(range(len(indices)), importances[indices], align='center')
-    plt.yticks(range(len(indices)), [X_train_model.columns[i] for i in indices])
-    plt.title('Feature Importance for Classification')
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, 'classification_feature_importance.png'), dpi=300)
     
     # Analyze per-class accuracy by conditions
     if 'turbulence' in X_test.columns:
