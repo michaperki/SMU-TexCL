@@ -1,0 +1,84 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Virtual environments
+venv/
+env/
+ENV/
+.env/
+.venv/
+env.bak/
+venv.bak/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.spyderproject
+.spyproject
+.ropeproject
+
+# Project specific
+logs/
+output/
+*/output/
+*/*/output/
+analysis_output/
+.cache/
+*.parquet
+*.csv
+*.pkl
+*.pt
+*.h5
+*.json
+!requirements.json
+
+# Operating system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Data files - comment these out if you want to include them
+# *.csv
+# *.json
+# *.parquet
+# *.h5
+
+# Models - comment these out if you want to include them
+# *.pt
+# *.pth
+
+# Debug logs
+*.log
+.coverage
+htmlcov/
+.pytest_cache/
